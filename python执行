@@ -1,0 +1,244 @@
+# ============== 原始版及修正版 ==============
+import requests
+import json
+import time
+import hashlib
+import hmac
+from datetime import datetime
+import pandas as pd
+import os
+
+# ================= 配置区 =================
+APP_KEY = "7594740370877974066"
+APP_SECRET = "17c5ae02-19d6-4a2d-aa41-f20901858c85"
+METHOD = "buyin.instituteOrderMCN"
+ACCESS_TOKEN = "1epv9xduwc1lp8ursirb96a7qc7262657484790268194-11"
+
+# ================= 1. 时间设置 =================
+print("⏳ 请设置查询时间范围")
+print("-" * 30)
+
+start_input = input("👉 请输入【开始】时间 (格式 2026-01-01 00:00:00): ").strip()
+if not start_input:
+    start_input = "2026-01-02 15:04:05"
+    print(f"⚠️ 未输入，使用默认: {start_input}")
+
+now = datetime.now()
+end_input = now.strftime("%Y-%m-%d %H:%M:%S")
+
+print(f"✅ 锁定开始时间: {start_input}")
+print(f"✅ 锁定结束时间: {end_input}")
+print("-" * 30)
+
+# ================= 2. 核心抓取逻辑 =================
+current_cursor = "0"
+page_size = "200"
+all_orders = []
+page_count = 1
+
+print(f"🚀 启动抓取 (页容量: {page_size})")
+
+while True:
+    print(f"\r🚀 正在抓取第 {page_count} 页 (已获取 {len(all_orders)} 条)...", end="")
+
+    body_data = {
+        "cursor": str(current_cursor),
+        "end_time": end_input,
+        "size": page_size,
+        "start_time": start_input,
+        "time_type": "pay"
+    }
+    param_json = json.dumps(body_data, separators=(',', ':'), ensure_ascii=False)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sign_str = f"app_key{APP_KEY}method{METHOD}param_json{param_json}timestamp{timestamp}v2"
+    sign_pattern = APP_SECRET + sign_str + APP_SECRET
+    sign = hmac.new(APP_SECRET.encode('utf-8'), sign_pattern.encode('utf-8'), hashlib.sha256).hexdigest()
+
+    url = "https://openapi-fxg.jinritemai.com/buyin/instituteOrderMCN"
+    params = {
+        "method": METHOD, "app_key": APP_KEY, "access_token": ACCESS_TOKEN,
+        "timestamp": timestamp, "v": "2", "sign": sign, "sign_method": "hmac-sha256"
+    }
+
+    try:
+        response = requests.post(url, params=params, data=param_json, headers={'Content-Type': 'application/json'})
+        result = response.json()
+    except Exception as e:
+        print(f"\n❌ 第 {page_count} 页请求失败: {e}")
+        break
+
+    data_part = result.get("data", {})
+    if data_part is None: data_part = {}
+    
+    order_list = data_part.get("orders") or data_part.get("list") or []
+    count = len(order_list)
+
+    if count > 0:
+        all_orders.extend(order_list)
+        new_cursor = data_part.get("cursor")
+        if new_cursor and str(new_cursor) != str(current_cursor):
+            current_cursor = str(new_cursor)
+            page_count += 1
+            time.sleep(0.2) 
+        else:
+            print(f"\n🏁 服务器未返回新页面游标，抓取结束。")
+            break
+    else:
+        print(f"\n⚠️ 第 {page_count} 页数据为空，停止抓取。")
+        break
+
+# ================= 3. 数据处理与导出 (双版本) =================
+print(f"\n\n🎉 抓取完成！总共 {len(all_orders)} 条。正在分别生成两份表格...")
+
+if len(all_orders) > 0:
+    
+    # 【通用处理】先把所有ID转为字符串 (避免两份表格都出现科学计数法)
+    for order in all_orders:
+        if 'media_id' in order and order['media_id'] is not None:
+            order['media_id'] = str(order['media_id'])
+    
+    # ---------------------------------------------------------
+    # 📂 版本一：原始版 (保留英文，原汁原味，指定顺序)
+    # ---------------------------------------------------------
+    print("🔧 正在生成 [原始版]...")
+    df_raw = pd.DataFrame(all_orders)
+    
+    # 1. 原始版要求的字段顺序
+    raw_columns_order = [
+        'order_id', 'product_id', 'product_name', 'product_img', 'author_account',
+        'author_openid', 'shop_name', 'total_pay_amount', 'commission_rate',
+        'estimated_commission', 'real_commission', 'flow_point', 'app',
+        'update_time', 'pay_success_time', 'settle_time', 'pay_goods_amount',
+        'settled_goods_amount', 'shop_id', 'shop_estimated_commission',
+        'shop_real_commission', 'alliance_split_rate', 'tech_service_fee_rate',
+        'estimated_tech_service_fee', 'settled_tech_service_fee',
+        'estimated_institution_commission', 'institution_commission', 'item_num',
+        'refund_time', 'estimated_total_commission', 'ads_estimated_commission',
+        'ads_real_commission', 'author_short_id', 'ads_promotion_rate', 'extra',
+        'author_buyin_id', 'media_type', 'media_id', 'pay_subsidy',
+        'platform_subsidy', 'author_subsidy', 'estimated_user_stepped_commission',
+        'estimated_inst_stepped_commission', 'settle_user_stepped_commission',
+        'settle_inst_stepped_commission', 'is_stepped_plan'
+    ]
+
+    # 2. 补全缺失列 & 排序
+    for col in raw_columns_order:
+        if col not in df_raw.columns:
+            df_raw[col] = "" # 缺失补空
+    df_raw = df_raw[raw_columns_order] # 强制排序
+
+    # ---------------------------------------------------------
+    # 📂 版本二：修正版 (数值计算 + 映射 + 汉化)
+    # ---------------------------------------------------------
+    print("🔧 正在生成 [修正版]...")
+    # 复制一份数据，以免修改影响到上面的原始版
+    df_revised = df_raw.copy()
+
+    # 1. 定义映射关系 (新增需求)
+    flow_point_map = {
+        'PAY_SUCC': '订单付款',
+        'REFUND': '订单退货退款',
+        'SETTLE': '订单结算',
+        'CONFIRM': '订单收货'
+    }
+    media_type_map = {
+        'shop_list': '橱窗',
+        'video': '视频',
+        'live': '直播',
+        'others': '其他'
+    }
+
+    # 2. 执行映射 (使用 map，如果没有匹配到则保留原值)
+    if 'flow_point' in df_revised.columns:
+        df_revised['flow_point'] = df_revised['flow_point'].map(flow_point_map).fillna(df_revised['flow_point'])
+    
+    if 'media_type' in df_revised.columns:
+        df_revised['media_type'] = df_revised['media_type'].map(media_type_map).fillna(df_revised['media_type'])
+
+    # 3. 数值计算 (分->元，万分位->百分比)
+    money_cols = [
+        'pay_goods_amount', 'estimated_total_commission', 'estimated_commission', 
+        'estimated_institution_commission', 'settled_goods_amount', 'real_commission', 
+        'institution_commission', 'estimated_tech_service_fee', 'settled_tech_service_fee', 
+        'estimated_user_stepped_commission', 'estimated_inst_stepped_commission', 
+        'settle_user_stepped_commission', 'settle_inst_stepped_commission', 
+        'pay_subsidy', 'platform_subsidy', 'author_subsidy', 'total_pay_amount',
+        'shop_estimated_commission', 'shop_real_commission' 
+    ]
+    rate_cols = ['commission_rate', 'alliance_split_rate', 'tech_service_fee_rate']
+
+    for col in money_cols:
+        if col in df_revised.columns:
+            # 先转成数字类型，无法转的变NaN (errors='coerce')
+            df_revised[col] = pd.to_numeric(df_revised[col], errors='coerce').fillna(0)
+            df_revised[col] = (df_revised[col] / 100).round(2)
+
+    for col in rate_cols:
+        if col in df_revised.columns:
+            df_revised[col] = pd.to_numeric(df_revised[col], errors='coerce').fillna(0)
+            # 使用 apply 实现百分比格式化
+            df_revised[col] = df_revised[col].apply(lambda x: f"{int(x/100)}%")
+
+    # 4. 汉化与重排
+    rename_map = {
+        'order_id': '订单id', 'product_id': '商品id', 'product_name': '商品名称',
+        'flow_point': '订单状态', 'author_account': '达人昵称', 'author_short_id': '达人抖音号',
+        'pay_goods_amount': '成交金额', 'commission_rate': '佣金率', 'estimated_total_commission': '总佣金收入',
+        'estimated_commission': '预估佣金收入-达人', 'estimated_institution_commission': '预估佣金收入-机构',
+        'settled_goods_amount': '结算金额', 'real_commission': '结算佣金收入-达人',
+        'institution_commission': '结算佣金收入-机构', 'pay_success_time': '订单支付时间',
+        'settle_time': '订单结算时间', 'alliance_split_rate': '分成比例',
+        'estimated_tech_service_fee': '预估技术服务费', 'settled_tech_service_fee': '结算技术服务费',
+        'shop_id': '店铺id', 'shop_name': '店铺名称', 'item_num': '商品数量',
+        'is_stepped_plan': '是否阶梯佣金', 'estimated_user_stepped_commission': '达人预估奖励佣金收入',
+        'estimated_inst_stepped_commission': '机构预估奖励佣金收入',
+        'settle_user_stepped_commission': '达人结算奖励佣金收入',
+        'settle_inst_stepped_commission': '机构结算奖励佣金收入', 'pay_subsidy': '支付补贴',
+        'platform_subsidy': '平台补贴', 'author_subsidy': '达人补贴', 'media_type': '流量来源'
+    }
+    df_revised.rename(columns=rename_map, inplace=True)
+
+    # 修正版要求的最终顺序
+    revised_columns_order = [
+        '订单id', '商品id', '商品名称', '订单状态', '超时未结算原因',
+        '达人昵称', '达人抖音号', '成交金额', '佣金率', '总佣金收入',
+        '预估佣金收入-达人', '预估佣金收入-机构', '结算金额', '结算佣金收入-达人',
+        '结算佣金收入-机构', '订单支付时间', '订单收货时间', '订单结算时间',
+        '分成比例', '预估技术服务费', '结算技术服务费', '新老账户',
+        '商品来源', '尾款支付时间', '定金金额', '店铺id', '店铺名称',
+        '商品数量', '安心购', '佣金发票', '冻结比例', '是否阶梯佣金',
+        '门槛销量', '基础佣金率', '升佣佣金率', '达人预估奖励佣金收入',
+        '机构预估奖励佣金收入', '达人结算奖励佣金收入', '机构结算奖励佣金收入',
+        '阶梯计划ID', '支付补贴', '平台补贴', '达人补贴', '运费', '税费',
+        '运费补贴', '分销来源', '营销活动id', '推广费率', '推广技术服务费',
+        '预估推广费收入', '结算推广费收入', '佣金类型', '订单来源',
+        '流量细分来源', '流量来源', '订单类型'
+    ]
+    
+    for col in revised_columns_order:
+        if col not in df_revised.columns:
+            df_revised[col] = ""
+    df_revised = df_revised[revised_columns_order]
+
+    # ---------------------------------------------------------
+    # 💾 保存双文件
+    # ---------------------------------------------------------
+    downloads_path = os.path.join(os.path.expanduser("~"), 'Downloads')  
+    today_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # 文件 1：原始版
+    file_raw = f'MCN 订单_{today_str}_{len(all_orders)}条_原始版.xlsx'
+    path_raw = os.path.join(downloads_path, file_raw)
+    df_raw.to_excel(path_raw, index=False)
+    
+    # 文件 2：修正版
+    file_revised = f'MCN 订单_{today_str}_{len(all_orders)}条_修正版.xlsx'
+    path_revised = os.path.join(downloads_path, file_revised)
+    df_revised.to_excel(path_revised, index=False)
+    
+    print(f"\n✅ 全部处理完毕！已在【下载】文件夹生成 2 个文件：")
+    print(f"📄 1. {file_raw} (包含所有英文字段，顺序已调整)")
+    print(f"📄 2. {file_revised} (中文表头，金额/状态/流量来源已修正)")
+else:
+    print("⚠️ 未抓取到数据。")
